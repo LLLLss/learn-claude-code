@@ -176,6 +176,23 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+def print_msg(message: dict):
+    """Print message with role-specific color."""
+    c = {"user": "\033[36m", "assistant": "\033[32m"}.get(message.get("role", ""), "\033[0m")
+    content = message.get("content", "")
+    if isinstance(content, str):
+        print(f"{c}{content}\033[0m")
+    elif hasattr(content, "text"):
+        print(f"{c}{content.text}\033[0m")
+    elif isinstance(content, list):
+        for item in content:
+            if hasattr(item, "text"):
+                print(f"{c}{item.text}\033[0m")
+            elif isinstance(item, dict) and item.get("type") == "tool_result":
+                print(f"\033[33m tool_use: {item.get('tool_use_id', '')}, "
+                      f"tool_result: {item.get('content', '')[:200]}...\033[0m")
+
+
 TOOL_HANDLERS = {
     "bash":        lambda **kw: run_bash(kw["command"]),
     "read_file":   lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -214,6 +231,8 @@ def agent_loop(messages: list):
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
+        print_msg(messages[-1])
+
         if response.stop_reason != "tool_use":
             return
         results = []
@@ -224,7 +243,9 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                print(f"> tool_use: {block.name}\n"
+                      f"> tool_input: {block.input}\n"
+                      f"> tool_result: {str(output)[:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
 
@@ -240,9 +261,4 @@ if __name__ == "__main__":
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
         print()

@@ -68,6 +68,10 @@ def detect_repo_root(cwd: Path) -> Path | None:
         return None
 
 
+TOKEN_SAVE_PROMPT = "No fluff, no intro, no outro. Direct answer only."
+SEP_LINE = "=" * 50
+
+
 REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
 
 SYSTEM = (

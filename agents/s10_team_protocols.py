@@ -6,7 +6,7 @@ s10_team_protocols.py - Team Protocols
 Shutdown protocol and plan approval protocol, both using the same
 request_id correlation pattern. Builds on s09's team messaging.
 
-    Shutdown FSM: pending -> approved | rejected
+    Shutdown FSM(Finite State Machine): pending -> approved | rejected
 
     Lead                              Teammate
     +---------------------+          +---------------------+
@@ -68,13 +68,18 @@ MODEL = os.environ["MODEL_ID"]
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
 
-SYSTEM = f"You are a team lead at {WORKDIR}. Manage teammates with shutdown and plan approval protocols."
+SYSTEM = (f"You are a team lead at {WORKDIR}. "
+          f"Your job is to COORDINATE teammates to solve problem - not to DO. "
+          f"Spawn only one teammate and delegate via inboxes. "
+          f"Manage teammate with shutdown and plan approval protocols."
+          f"No fluff, no intro, no outro. Direct answer only.")
 
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
     "shutdown_request",
     "shutdown_response",
+    "plan_approval_request",
     "plan_approval_response",
 }
 
@@ -178,6 +183,7 @@ class TeammateManager:
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Submit plans via plan_approval before major work. "
             f"Respond to shutdown_request with shutdown_response."
+            f"No fluff, no intro, no outro. Direct answer only."
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
@@ -199,13 +205,18 @@ class TeammateManager:
             except Exception:
                 break
             messages.append({"role": "assistant", "content": response.content})
+            print_msg(messages[-1])
             if response.stop_reason != "tool_use":
                 break
             results = []
             for block in response.content:
                 if block.type == "tool_use":
                     output = self._exec(name, block.name, block.input)
-                    print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                    print(f"\033[37m> {'=' * 20} [{name}] {'=' * 20}\n"
+                          f"> tool_use: {block.name}\n"
+                          f"> tool_input: {block.input}\n"
+                          f"> tool_result: {str(output)[:200]}\n\033[0m"
+                          )
                     results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -250,31 +261,53 @@ class TeammateManager:
             with _tracker_lock:
                 plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
             BUS.send(
-                sender, "lead", plan_text, "plan_approval_response",
+                sender, "lead", plan_text, "plan_approval_request",
                 {"request_id": req_id, "plan": plan_text},
             )
             return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
+        if tool_name == "check_plan_status":
+            req_id = args.get("request_id", "")
+            with _tracker_lock:
+                req = plan_requests.get(req_id)
+            if not req:
+                return f"Error: Unknown plan request_id '{req_id}'"
+            return json.dumps({"request_id": req_id, "status": req["status"], "plan": req["plan"]}, indent=2)
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
         # these base tools are unchanged from s02
         return [
             {"name": "bash", "description": "Run a shell command.",
-             "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+             "input_schema": {"type": "object", "properties": {"command": {"type": "string"}},
+                              "required": ["command"]}},
             {"name": "read_file", "description": "Read file contents.",
              "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
             {"name": "write_file", "description": "Write content to file.",
-             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+             "input_schema": {"type": "object",
+                              "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                              "required": ["path", "content"]}},
             {"name": "edit_file", "description": "Replace exact text in file.",
-             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+             "input_schema": {"type": "object",
+                              "properties": {"path": {"type": "string"}, "old_text": {"type": "string"},
+                                             "new_text": {"type": "string"}},
+                              "required": ["path", "old_text", "new_text"]}},
             {"name": "send_message", "description": "Send message to a teammate.",
-             "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
+             "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"},
+                                                               "msg_type": {"type": "string",
+                                                                            "enum": list(VALID_MSG_TYPES)}},
+                              "required": ["to", "content"]}},
             {"name": "read_inbox", "description": "Read and drain your inbox.",
              "input_schema": {"type": "object", "properties": {}}},
-            {"name": "shutdown_response", "description": "Respond to a shutdown request. Approve to shut down, reject to keep working.",
-             "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
+            {"name": "shutdown_response",
+             "description": "Respond to a shutdown request. Approve to shut down, reject to keep working.",
+             "input_schema": {"type": "object",
+                              "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"},
+                                             "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
             {"name": "plan_approval", "description": "Submit a plan for lead approval. Provide plan text.",
              "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
+            {"name": "check_plan_status", "description": "Check the status of a submitted plan by request_id.",
+             "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}},
+                              "required": ["request_id"]}},
         ]
 
     def list_all(self) -> str:
@@ -378,20 +411,37 @@ def _check_shutdown_status(request_id: str) -> str:
         return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
 
 
+def print_msg(message: dict):
+    """Print message with role-specific color."""
+    c = {"user": "\033[36m", "assistant": "\033[32m"}.get(message.get("role", ""), "\033[0m")
+    content = message.get("content", "")
+    if isinstance(content, str):
+        print(f"{c}{content}\033[0m")
+    elif hasattr(content, "text"):
+        print(f"{c}{content.text}\033[0m")
+    elif isinstance(content, list):
+        for item in content:
+            if hasattr(item, "text"):
+                print(f"{c}{item.text}\033[0m")
+            elif isinstance(item, dict) and item.get("type") == "tool_result":
+                print(f"\033[33m tool_use: {item.get('tool_use_id', '')}, "
+                      f"tool_result: {item.get('content', '')[:200]}...\033[0m")
+
+
 # -- Lead tool dispatch (12 tools) --
 TOOL_HANDLERS = {
-    "bash":              lambda **kw: _run_bash(kw["command"]),
-    "read_file":         lambda **kw: _run_read(kw["path"], kw.get("limit")),
-    "write_file":        lambda **kw: _run_write(kw["path"], kw["content"]),
-    "edit_file":         lambda **kw: _run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "spawn_teammate":    lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
-    "list_teammates":    lambda **kw: TEAM.list_all(),
-    "send_message":      lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
-    "read_inbox":        lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
-    "broadcast":         lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
-    "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),
+    "bash": lambda **kw: _run_bash(kw["command"]),
+    "read_file": lambda **kw: _run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: _run_write(kw["path"], kw["content"]),
+    "edit_file": lambda **kw: _run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "spawn_teammate": lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
+    "list_teammates": lambda **kw: TEAM.list_all(),
+    "send_message": lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
+    "read_inbox": lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
+    "broadcast": lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
+    "shutdown_request": lambda **kw: handle_shutdown_request(kw["teammate"]),
     "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
-    "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
+    "plan_approval": lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
 }
 
 # these base tools are unchanged from s02
@@ -399,27 +449,39 @@ TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
+                      "required": ["path"]}},
     {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                      "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"},
+                                                       "new_text": {"type": "string"}},
+                      "required": ["path", "old_text", "new_text"]}},
     {"name": "spawn_teammate", "description": "Spawn a persistent teammate.",
-     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, "required": ["name", "role", "prompt"]}},
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "role": {"type": "string"},
+                                                       "prompt": {"type": "string"}},
+                      "required": ["name", "role", "prompt"]}},
     {"name": "list_teammates", "description": "List all teammates.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "send_message", "description": "Send a message to a teammate.",
-     "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
+     "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"},
+                                                       "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}},
+                      "required": ["to", "content"]}},
     {"name": "read_inbox", "description": "Read and drain the lead's inbox.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "broadcast", "description": "Send a message to all teammates.",
      "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
-    {"name": "shutdown_request", "description": "Request a teammate to shut down gracefully. Returns a request_id for tracking.",
+    {"name": "shutdown_request",
+     "description": "Request a teammate to shut down gracefully. Returns a request_id for tracking.",
      "input_schema": {"type": "object", "properties": {"teammate": {"type": "string"}}, "required": ["teammate"]}},
     {"name": "shutdown_response", "description": "Check the status of a shutdown request by request_id.",
      "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}}, "required": ["request_id"]}},
-    {"name": "plan_approval", "description": "Approve or reject a teammate's plan. Provide request_id + approve + optional feedback.",
-     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
+    {"name": "plan_approval",
+     "description": "Approve or reject a teammate's plan. Provide request_id + approve + optional feedback.",
+     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"},
+                                                       "feedback": {"type": "string"}},
+                      "required": ["request_id", "approve"]}},
 ]
 
 
@@ -443,6 +505,7 @@ def agent_loop(messages: list):
             max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
+        print_msg(messages[-1])
         if response.stop_reason != "tool_use":
             return
         results = []
@@ -453,7 +516,9 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                print(f"> tool_use: {block.name}\n"
+                      f"> tool_input: {block.input}\n"
+                      f"> tool_result: {str(output)[:200]}")
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -479,9 +544,4 @@ if __name__ == "__main__":
             continue
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
         print()

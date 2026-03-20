@@ -60,7 +60,10 @@ TASKS_DIR = WORKDIR / ".tasks"
 POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
 
-SYSTEM = f"You are a team lead at {WORKDIR}. Teammates are autonomous -- they find work themselves."
+TOKEN_SAVE_PROMPT = "No fluff, no intro, no outro. Direct answer only."
+SEP_LINE = "=" * 50
+
+SYSTEM = f"You are a team lead at {WORKDIR}. Teammates are autonomous -- they find work themselves. {TOKEN_SAVE_PROMPT}"
 
 VALID_MSG_TYPES = {
     "message",
@@ -210,6 +213,7 @@ class TeammateManager:
         sys_prompt = (
             f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
             f"Use idle tool when you have no more work. You will auto-claim new tasks."
+            f"{TOKEN_SAVE_PROMPT}"
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
@@ -217,12 +221,14 @@ class TeammateManager:
         while True:
             # -- WORK PHASE: standard agent loop --
             for _ in range(50):
+                # 读消息箱，看是否被叫停
                 inbox = BUS.read_inbox(name)
                 for msg in inbox:
                     if msg.get("type") == "shutdown_request":
                         self._set_status(name, "shutdown")
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
+                # 未被叫停
                 try:
                     response = client.messages.create(
                         model=MODEL,
@@ -240,18 +246,21 @@ class TeammateManager:
                 results = []
                 idle_requested = False
                 for block in response.content:
-                    if block.type == "tool_use":
-                        if block.name == "idle":
-                            idle_requested = True
-                            output = "Entering idle phase. Will poll for new tasks."
-                        else:
-                            output = self._exec(name, block.name, block.input)
-                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                        results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": str(output),
-                        })
+                    if block.type != "tool_use":
+                        print(f"\033[37m{name}: {block}\033[0m")
+                        continue
+
+                    if block.name == "idle":
+                        idle_requested = True
+                        output = "Entering idle phase. Will poll for new tasks."
+                    else:
+                        output = self._exec(name, block.name, block.input)
+                    print(f"\033[37m[{name}] {block.name}: {str(output)[:120]}\033[0m")
+                    results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(output),
+                    })
                 messages.append({"role": "user", "content": results})
                 if idle_requested:
                     break
@@ -262,22 +271,27 @@ class TeammateManager:
             polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
             for _ in range(polls):
                 time.sleep(POLL_INTERVAL)
+
                 inbox = BUS.read_inbox(name)
-                if inbox:
+                if inbox: # 有新消息
+                    # 看有没有 shutdown 消息
                     for msg in inbox:
                         if msg.get("type") == "shutdown_request":
                             self._set_status(name, "shutdown")
                             return
                         messages.append({"role": "user", "content": json.dumps(msg)})
+                    # 没有shutdown
                     resume = True
-                    break
+                    break  # 需要跳出 idle 状态
+
+                # 没有收到新消息，自己去找活干
                 unclaimed = scan_unclaimed_tasks()
                 if unclaimed:
                     task = unclaimed[0]
                     claim_task(task["id"], name)
                     task_prompt = (
-                        f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
-                        f"{task.get('description', '')}</auto-claimed>"
+                        f"\033[38m<auto-claimed>Task #{task['id']}: {task['subject']}\n"
+                        f"{task.get('description', '')}</auto-claimed>\033[0m"
                     )
                     if len(messages) <= 3:
                         messages.insert(0, make_identity_block(name, role, team_name))
@@ -287,6 +301,7 @@ class TeammateManager:
                     resume = True
                     break
 
+            # 轮询下来，没有新消息，也没有 pending 任务，自己 shutdown
             if not resume:
                 self._set_status(name, "shutdown")
                 return
@@ -456,6 +471,23 @@ def _check_shutdown_status(request_id: str) -> str:
         return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
 
 
+def print_msg(message: dict):
+    """Print message with role-specific color."""
+    c = {"user": "\033[36m", "assistant": "\033[32m"}.get(message.get("role", ""), "\033[0m")
+    content = message.get("content", "")
+    if isinstance(content, str):
+        print(f"{c}{content}\033[0m")
+    elif hasattr(content, "text"):
+        print(f"{c}{content.text}\033[0m")
+    elif isinstance(content, list):
+        for item in content:
+            if hasattr(item, "text"):
+                print(f"{c}{item.text}\033[0m")
+            elif isinstance(item, dict) and item.get("type") == "tool_result":
+                print(f"\033[33m tool_use: {item.get('tool_use_id', '')}, "
+                      f"tool_result: {item.get('content', '')[:200]}...\033[0m")
+
+
 # -- Lead tool dispatch (14 tools) --
 TOOL_HANDLERS = {
     "bash":              lambda **kw: _run_bash(kw["command"]),
@@ -515,6 +547,7 @@ def agent_loop(messages: list):
                 "role": "user",
                 "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
             })
+            print_msg(messages[-1])
             messages.append({
                 "role": "assistant",
                 "content": "Noted inbox messages.",
@@ -531,18 +564,21 @@ def agent_loop(messages: list):
             return
         results = []
         for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(output),
-                })
+            if block.type != "tool_use":
+                print(f"\033[32m{block}\033[0m")
+                continue
+
+            handler = TOOL_HANDLERS.get(block.name)
+            try:
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"\033[32m{SEP_LINE}{block.name}: {block.input}\n{str(output)[:200]}\033[0m")
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": str(output),
+            })
         messages.append({"role": "user", "content": results})
 
 

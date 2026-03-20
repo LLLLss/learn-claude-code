@@ -54,7 +54,7 @@ MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
 
-THRESHOLD = 50000
+THRESHOLD = 15000
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 KEEP_RECENT = 3
 
@@ -75,6 +75,7 @@ def micro_compact(messages: list) -> list:
                     tool_results.append((msg_idx, part_idx, part))
     if len(tool_results) <= KEEP_RECENT:
         return messages
+    print(f"[before micro_compact token cnt is: {estimate_tokens(messages)}]")
     # Find tool_name for each result by matching tool_use_id in prior assistant messages
     tool_name_map = {}
     for msg in messages:
@@ -86,11 +87,24 @@ def micro_compact(messages: list) -> list:
                         tool_name_map[block.id] = block.name
     # Clear old results (keep last KEEP_RECENT)
     to_clear = tool_results[:-KEEP_RECENT]
-    for _, _, result in to_clear:
+    for _, _, result in to_clear: # 只使用 tool_results 里的 part，是一个 dict
         if isinstance(result.get("content"), str) and len(result["content"]) > 100:
             tool_id = result.get("tool_use_id", "")
             tool_name = tool_name_map.get(tool_id, "unknown")
+            # 这里修改字典的 value，其实修改的是 messages 里工具调用返回内容值
+            # tool_result消息示例：
+            # {'role': 'user',
+            #  'content': [
+            #               {
+            #                 'type': 'tool_result',
+            #                 'tool_use_id': 'call_a4891daa46fd4ce08804deb2',
+            #                 'content': "Error: 'utf-8' codec can't decode byte 0x8f in position 10: invalid start byte"
+            #                }
+            #             ]
+            # }
+            # 即 messages[i].content[j].content
             result["content"] = f"[Previous: used {tool_name}]"
+    print(f"[after micro_compact token cnt is: {estimate_tokens(messages)}]")
     return messages
 
 
@@ -192,12 +206,31 @@ TOOLS = [
 ]
 
 
+def print_msg(message: dict):
+    """Print message with role-specific color."""
+    c = {"user": "\033[36m", "assistant": "\033[32m"}.get(message.get("role", ""), "\033[0m")
+    content = message.get("content", "")
+    if isinstance(content, str):
+        print(f"{c}{content}\033[0m")
+    elif hasattr(content, "text"):
+        print(f"{c}{content.text}\033[0m")
+    elif isinstance(content, list):
+        for item in content:
+            if hasattr(item, "text"):
+                print(f"{c}{item.text}\033[0m")
+            elif isinstance(item, dict) and item.get("type") == "tool_result":
+                print(f"\033[33m tool_use: {item.get('tool_use_id', '')}, "
+                      f"tool_result: {item.get('content', '')[:200]}...\033[0m")
+
+
 def agent_loop(messages: list):
-    while True:
+    while True: # 内层只有 assistant 及 user的工具调用结果
         # Layer 1: micro_compact before each LLM call
         micro_compact(messages)
         # Layer 2: auto_compact if token estimate exceeds threshold
-        if estimate_tokens(messages) > THRESHOLD:
+        history_token_cnt = estimate_tokens(messages)
+        print(f"[history token cnt is: {history_token_cnt}]")
+        if history_token_cnt > THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
         response = client.messages.create(
@@ -205,6 +238,8 @@ def agent_loop(messages: list):
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
+        print_msg(messages[-1])
+
         if response.stop_reason != "tool_use":
             return
         results = []
@@ -220,9 +255,12 @@ def agent_loop(messages: list):
                         output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                     except Exception as e:
                         output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                print(f"> tool_use: {block.name}\n"
+                      f"> tool_input: {block.input}\n"
+                      f"> tool_result: {str(output)[:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
+
         # Layer 3: manual compact triggered by the compact tool
         if manual_compact:
             print("[manual compact]")
@@ -231,7 +269,7 @@ def agent_loop(messages: list):
 
 if __name__ == "__main__":
     history = []
-    while True:
+    while True: # 外层接受用户输入
         try:
             query = input("\033[36ms06 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
@@ -240,9 +278,4 @@ if __name__ == "__main__":
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
         print()

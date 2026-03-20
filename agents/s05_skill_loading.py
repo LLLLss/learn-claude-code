@@ -103,7 +103,8 @@ class SkillLoader:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
         return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
 
-
+# SKILL_LOADER 加载全部 skill，但只在系统提示词注入所有 skill 的元信息
+# 在 TOOL_HANDLERS 里，提供一个加载 skill 详情的工具，供 LLM 调用
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
 # Layer 1: skill metadata injected into system prompt
@@ -191,19 +192,23 @@ def agent_loop(messages: list):
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+        print(f"\033[34m> {messages[-1]}\033[0m")
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                print(f"\033[33m> {block.name}\033[0m")
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                print(f"\033[33m{str(output)[:200]}\033[0m")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+            else:
+                print(f"\033[32m> assistant: {block.text}\033[0m")
         messages.append({"role": "user", "content": results})
 
 
@@ -222,5 +227,5 @@ if __name__ == "__main__":
         if isinstance(response_content, list):
             for block in response_content:
                 if hasattr(block, "text"):
-                    print(block.text)
+                    print(f"\033[32m{block.text}\033[0m")
         print()

@@ -41,6 +41,16 @@ its own agent loop in a separate thread. Communication via append-only inboxes.
     +-------------------------+-----------------------------------+
 
 Key insight: "Teammates that can talk to each other."
+
+执行效果如下：
+s09 >> 帮我写一个投顾系统，主要投资场外基金，包含数据分析、制定投资决策，要求代码简洁，架构清晰。需要对写完的代码进行 review 及 测试。
+我将帮你创建一个结构清晰的投顾系统。让我先规划一下任务，然后分步实现。
+> tool_use: spawn_teammate
+> tool_input: {'name': '架构师Alex', 'role': '系统架构师', 'prompt': '你负责设计这个投顾系统的整体架构，确保代码简洁、模块化。需要考虑：\n1. 系统模块划分（数据层、业务逻方案\n\n请先提供一个清晰的架构设计文档。'}
+> tool_result: Spawned '架构师Alex' (role: 系统架构师)
+> tool_use: spawn_teammate
+> tool_input: {'name': '代码审查员李明', 'role': '代码审查专家', 'prompt': '你负责review所有代码的质量，确保：\n1. 代码风格符合Python最佳实践\n2. 有适当的错误处理\n3. 代构师提供的架构设计，审查所有实现代码，并提出改进建议。'}
+> tool_result: Spawned '代码审查员李明' (role: 代码审查专家)
 """
 
 import json
@@ -95,6 +105,7 @@ class MessageBus:
         inbox_path = self.dir / f"{to}.jsonl"
         with open(inbox_path, "a") as f:
             f.write(json.dumps(msg) + "\n")
+        print(f"\033[37ms09 [send msg module] {msg}\033[0m")
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
@@ -185,13 +196,20 @@ class TeammateManager:
             except Exception:
                 break
             messages.append({"role": "assistant", "content": response.content})
+            print_msg(messages[-1])
+
             if response.stop_reason != "tool_use":
                 break
             results = []
             for block in response.content:
                 if block.type == "tool_use":
                     output = self._exec(name, block.name, block.input)
-                    print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                    print(f"  [{name}]")
+                    print(f"> {'='*20} [{name}] {'='*20}\n"
+                          f"> tool_use: {block.name}\n"
+                          f"> tool_input: {block.input}\n"
+                          f"> tool_result: {str(output)[:200]}\n"
+                          f"> {'='*20} [{name}] {'='*20}")
                     results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -306,6 +324,23 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+def print_msg(message: dict):
+    """Print message with role-specific color."""
+    c = {"user": "\033[36m", "assistant": "\033[32m"}.get(message.get("role", ""), "\033[0m")
+    content = message.get("content", "")
+    if isinstance(content, str):
+        print(f"{c}{content}\033[0m")
+    elif hasattr(content, "text"):
+        print(f"{c}{content.text}\033[0m")
+    elif isinstance(content, list):
+        for item in content:
+            if hasattr(item, "text"):
+                print(f"{c}{item.text}\033[0m")
+            elif isinstance(item, dict) and item.get("type") == "tool_result":
+                print(f"\033[33m tool_use: {item.get('tool_use_id', '')}, "
+                      f"tool_result: {item.get('content', '')[:200]}...\033[0m")
+
+
 # -- Lead tool dispatch (9 tools) --
 TOOL_HANDLERS = {
     "bash":            lambda **kw: _run_bash(kw["command"]),
@@ -362,6 +397,8 @@ def agent_loop(messages: list):
             max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
+        print_msg(messages[-1])
+
         if response.stop_reason != "tool_use":
             return
         results = []
@@ -372,7 +409,9 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                print(f"> tool_use: {block.name}\n"
+                      f"> tool_input: {block.input}\n"
+                      f"> tool_result: {str(output)[:200]}")
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -398,9 +437,4 @@ if __name__ == "__main__":
             continue
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
         print()
