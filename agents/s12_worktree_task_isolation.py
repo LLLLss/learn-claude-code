@@ -80,6 +80,7 @@ SYSTEM = (
     "For parallel or risky changes: create tasks, allocate worktree lanes, "
     "run commands in those lanes, then choose keep/remove for closeout. "
     "Use worktree_events when you need lifecycle visibility."
+    f"{TOKEN_SAVE_PROMPT}"
 )
 
 
@@ -745,13 +746,19 @@ def agent_loop(messages: list):
 
         results = []
         for block in response.content:
+            if block.type != "tool_use":
+                print(f"\033[32m{block}\033[0m")
+                continue
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                print(f"\033[33m{block.name}\033[0m")
+                print(f"\033[33m{block.input}\033[0m")
+                print(f"\033[33m{str(output)[:200]}\033[0m")
+                print(f"\033[33m{SEP_LINE}\033[0m")
                 results.append(
                     {
                         "type": "tool_result",
